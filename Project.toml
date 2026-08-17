@@ -1,0 +1,17 @@
+name = "Idris2"
+uuid = "1d1e1f2a-3b4c-4d5e-8f6a-7b8c9d0e1f2a"
+authors = ["Chetan VARDHAN and contributors"]
+version = "0.1.0"
+
+[deps]
+Scratch = "6c6a2e73-6563-6170-7368-637461726353"
+
+[compat]
+Scratch = "1"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+ParallelTestRunner = "d3525ed8-44d0-4b2c-a655-542cee43accc"
+
+[targets]
+test = ["Test", "ParallelTestRunner"]

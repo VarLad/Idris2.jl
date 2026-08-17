@@ -1,0 +1,14 @@
+package idris2-julia
+version = 0.1.0
+
+depends = idris2, network
+
+sourcedir = "src"
+
+modules =
+    Main,
+    Compiler.Julia,
+    Compiler.Julia.Runtime
+
+main = Main
+executable = idris2jl
