@@ -1,15 +1,37 @@
-# Idris2 → Julia backend
+# Idris2.jl
 
-An external Idris2 code generator that compiles Idris2 programs to
-self-contained Julia modules, plus a small Julia package (`Idris2.jl`) for
-compiling and running Idris source strings inside an existing Julia process.
+A Julia package for compiling and running Idris 2 source strings inside an
+existing Julia process, powered by the `idris2jl` code generator (an external
+Idris2 backend that emits self-contained Julia modules).
 
 ```
-IdrisJulia/
-├── Idris2/            # the Idris2 compiler source (untouched)
-├── julia-backend/     # the Julia code generator (written in Idris2)
-└── Idris2.jl/         # the Julia-side loader package (written in Julia)
+Idris2.jl/
+├── Project.toml
+├── src/Idris2.jl      # the loader package (Julia)
+├── deps/
+│   ├── build.jl       # Pkg.build script
+│   └── julia-backend/ # the code generator source (Idris2)
+└── test/              # golden tests (Julia Test + ParallelTestRunner)
 ```
+
+## Installation
+
+The backend is built automatically by `Pkg.build("Idris2")` (run on
+install/update). This requires an Idris 2 installation with the `idris2` API
+library installed (present in the normal distribution); set
+`IDRIS2=/path/to/idris2` if `idris2` is not on `PATH`.
+
+```julia
+import Pkg
+Pkg.develop(path = "/path/to/IdrisJulia/Idris2.jl")
+# or Pkg.add("Idris2") once it is registered
+
+using Idris2
+```
+
+The built `idris2jl` executable is installed into a per-user Scratch space
+(not into the package tree), and is located by `Idris2.idris2jl_path()` at
+load time.
 
 ## How it works
 
@@ -26,28 +48,17 @@ Key design choices:
 - **Tail calls** use `Compiler.ES.TailRec` plus a small `_idris_tailRec`
   trampoline, so mutually tail-recursive functions don't overflow the stack.
 - **The runtime** is embedded directly into every generated module
-  (`src/Compiler/Julia/Runtime.idr`), so the output has no external Julia
-  dependencies.
+  (`deps/julia-backend/src/Compiler/Julia/Runtime.idr`), so the output has no
+  external Julia dependencies.
 - **FFI** supports inline `julia:lambda:` and `julia:support:` specifiers.
   A few core `Prelude.IO` primitives (`prim__putStr`, `prim__putChar`,
   `prim__getStr`) are implemented natively so basic IO works without modifying
   the standard library.
 
-## Building the backend
-
-The backend is vendored under `Idris2.jl/deps/julia-backend` and is built
-automatically by `Pkg.build("Idris2")` (which runs on install/update). It
-requires an Idris2 installation with the `idris2` API library installed (the
-`idris2` package is present in the normal distribution); set
-`IDRIS2=/path/to/idris2` if `idris2` is not on `PATH`.
-
-The built executable is installed into a per-user Scratch space (not into the
-package tree), and is located by `Idris2.idris2jl_path()` at load time.
-
-To build manually:
+## Building the backend manually
 
 ```bash
-cd Idris2.jl/deps/julia-backend
+cd deps/julia-backend
 idris2 --build julia-backend.ipkg
 # produces build/exec/idris2jl
 ```
