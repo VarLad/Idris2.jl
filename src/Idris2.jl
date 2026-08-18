@@ -135,7 +135,9 @@ function _library_source(source::AbstractString)::String
     lines = split(String(source), '\n')
     out = String[]
     for line in lines
-        m = match(r"^\s*([a-zA-Z_][a-zA-Z0-9_']*)\s*:", line)
+        # Only export top-level (column 0) signatures; indented lines are
+        # constructors, record fields, or declarations nested in blocks.
+        m = match(r"^([a-zA-Z_][a-zA-Z0-9_']*)\s*:", line)
         if m !== nothing && m.captures[1] != "main"
             push!(out, "%export \"julia:$(m.captures[1])\"")
         end
@@ -232,7 +234,7 @@ function _idris_string_literal(s::AbstractString)
     return String(take!(buf))
 end
 
-const INFIX_OPS = Set(["+", "-", "*", "/", "++", "^", "==", "<", "<=", ">", ">=", "&&", "||"])
+const INFIX_OPS = Set(["+", "-", "*", "/", "++", "^", "==", "<", "<=", ">", ">=", "&&", "||", ".."])
 
 function _emit_dotted_name(x)
     x isa QuoteNode && (x = x.value)
@@ -284,6 +286,11 @@ function _emit_expr(e::Expr)
         return _emit_idris(e.args[1]) * " :: " * _emit_idris(e.args[2])
     elseif e.head === :(->)
         lhs = _emit_idris(e.args[1])
+        if e.args[1] isa Expr &&
+           (e.args[1].head === :-> ||
+            (e.args[1].head === :call && e.args[1].args[1] === :(:)))
+            lhs = "(" * lhs * ")"
+        end
         rhs = _emit_idris(e.args[2])
         return lhs * " -> " * rhs
     elseif e.head === :(=)
@@ -299,6 +306,10 @@ function _emit_expr(e::Expr)
         head = _emit_idris(e.args[1])
         rest = join([_emit_idris(a) for a in e.args[2:end]], " ")
         return isempty(rest) ? head : head * " " * rest
+    elseif e.head === :braces
+        return "{" * join([_emit_idris(a) for a in e.args], ", ") * "}"
+    elseif e.head === :bracescat
+        error("the `{auto ...}` brace form is not supported by the DSL; use @auto(name, type) instead")
     elseif e.head === :module
         modname = _emit_import_path(e.args[2])
         body = _emit_idris(e.args[3])
@@ -348,21 +359,61 @@ function _emit_let_bindings(x)
     end
 end
 
+function _body_stmts(body)
+    if body isa Expr && body.head === :block
+        return Any[a for a in body.args if !(a isa LineNumberNode)]
+    else
+        return Any[body]
+    end
+end
+
 function _emit_variants(body)
     parts = String[]
-    for stmt in (body isa Expr && body.head === :block ? body.args : Any[body])
-        stmt isa LineNumberNode && continue
+    for stmt in _body_stmts(body)
         s = _emit_idris(stmt)
         isempty(s) || push!(parts, s)
     end
     return parts
 end
 
+function _parse_data_head(head)
+    if head isa Symbol
+        return String(head), String[]
+    elseif head isa Expr && head.head === :call
+        name = String(head.args[1])
+        rest = [_emit_idris(a) for a in head.args[2:end]]
+        return name, rest
+    else
+        return _emit_idris(head), String[]
+    end
+end
+
+# A constructor is "typed" (GADT `where` form) when written `Ctor : sig` or
+# `@ctor "name" : sig`.
+function _is_typed_variant(stmt)
+    if stmt isa Expr && stmt.head === :call && stmt.args[1] === :(:)
+        return true
+    elseif stmt isa Expr && stmt.head === :macrocall && stmt.args[1] === Symbol("@ctor")
+        payload = [a for a in stmt.args[2:end] if !(a isa LineNumberNode)]
+        return length(payload) == 1 && payload[1] isa Expr &&
+               payload[1].head === :call && payload[1].args[1] === :(:)
+    end
+    return false
+end
+
 function _emit_data(head, body)
-    h = _emit_idris(head)
+    name, params = _parse_data_head(head)
+    stmts = _body_stmts(body)
+    isempty(stmts) && error("@data requires at least one constructor")
     variants = _emit_variants(body)
-    isempty(variants) && error("@data requires at least one constructor")
-    return "data " * h * " = " * join(variants, " | ")
+    if any(_is_typed_variant, stmts)
+        kind = isempty(params) ? "Type" : join(params, " -> ") * " -> Type"
+        return "data " * name * " : " * kind * " where\n  " *
+               join(variants, "\n  ")
+    else
+        h = name * (isempty(params) ? "" : " " * join(params, " "))
+        return "data " * h * " = " * join(variants, " | ")
+    end
 end
 
 function _emit_record(head, body)
@@ -391,6 +442,8 @@ function _arg_emit(x)
     return s
 end
 
+_identish(s::String) = occursin(r"^[A-Za-z_][A-Za-z0-9_']*$", s)
+
 function _emit_call(e::Expr)
     f = e.args[1]
     args = e.args[2:end]
@@ -404,12 +457,80 @@ function _emit_call(e::Expr)
         return "-" * _emit_idris(args[1])
     else
         femit = _emit_idris(f)
+        if f isa Symbol
+            fs = String(f)
+            if !_identish(fs) && !(startswith(fs, "(") && endswith(fs, ")"))
+                femit = "(" * fs * ")"
+            end
+        end
         argstrs = [_arg_emit(a) for a in args]
         if isempty(argstrs)
             return femit * "()"
         end
         return femit * " " * join(argstrs, " ")
     end
+end
+
+function _indent(s::AbstractString, n::Int)
+    pad = repeat(" ", n)
+    return join([pad * line for line in split(String(s), "\n")], "\n")
+end
+
+function _case_clauses(body)
+    clauses = String[]
+    for stmt in _body_stmts(body)
+        if stmt isa Expr && stmt.head === :call && stmt.args[1] === :(=>) &&
+           length(stmt.args) == 3
+            push!(clauses, "  " * _emit_idris(stmt.args[2]) * " => " *
+                           _emit_idris(stmt.args[3]))
+        else
+            error("@case clause must be `pattern => body`, got: $(repr(stmt))")
+        end
+    end
+    isempty(clauses) && error("@case requires at least one clause")
+    return clauses
+end
+
+function _with_clauses(lhs::String, body)
+    clauses = String[]
+    for stmt in _body_stmts(body)
+        if stmt isa Expr && stmt.head === :call && stmt.args[1] === :(=>) &&
+           length(stmt.args) == 3
+            push!(clauses, "  " * lhs * " | " * _emit_idris(stmt.args[2]) *
+                           " = " * _emit_idris(stmt.args[3]))
+        else
+            error("@with clause must be `pattern => body`, got: $(repr(stmt))")
+        end
+    end
+    isempty(clauses) && error("@with requires at least one clause")
+    return clauses
+end
+
+# `x <- act` parses in Julia as `x < -act`, so detect that shape.
+function _is_bind(stmt)
+    return stmt isa Expr && stmt.head === :call && stmt.args[1] === :< &&
+           length(stmt.args) == 3 &&
+           stmt.args[3] isa Expr && stmt.args[3].head === :call &&
+           stmt.args[3].args[1] === :(-) && length(stmt.args[3].args) == 2
+end
+
+function _emit_do(body)
+    stmts = _body_stmts(body)
+    isempty(stmts) && error("@do requires at least one statement")
+    lines = String[]
+    for stmt in stmts
+        if _is_bind(stmt)
+            lhs = _emit_idris(stmt.args[2])
+            rhs = _emit_idris(stmt.args[3].args[2])
+            push!(lines, "  " * lhs * " <- " * rhs)
+        elseif stmt isa Expr && stmt.head === :(=)
+            push!(lines, "  let " * _emit_idris(stmt.args[1]) * " = " *
+                         _emit_idris(stmt.args[2]))
+        else
+            push!(lines, "  " * _emit_idris(stmt))
+        end
+    end
+    return "do\n" * join(lines, "\n")
 end
 
 function _emit_macrocall(e::Expr)
@@ -427,6 +548,76 @@ function _emit_macrocall(e::Expr)
     elseif name === Symbol("@record")
         length(args) == 2 || error("@record expects a head and a begin...end block")
         return _emit_record(args[1], args[2])
+    elseif name === Symbol("@ctor")
+        length(args) == 1 || error("@ctor expects one argument: the constructor name (optionally `: sig`)")
+        a = args[1]
+        if a isa AbstractString
+            return String(a)
+        elseif a isa Expr && a.head === :call && length(a.args) == 3 &&
+               a.args[1] === :(:) && a.args[2] isa AbstractString
+            return String(a.args[2]) * " : " * _emit_idris(a.args[3])
+        else
+            error("@ctor expects a string constructor name, got: $(repr(a))")
+        end
+    elseif name in (Symbol("@implicit"), Symbol("@auto"), Symbol("@erased"), Symbol("@linear"))
+        length(args) == 2 || error("$name expects (name, type)")
+        nam = _emit_idris(args[1])
+        ty = _emit_idris(args[2])
+        marker = name === Symbol("@implicit") ? "" :
+                 name === Symbol("@auto")     ? "auto " :
+                 name === Symbol("@erased")   ? "0 " : "1 "
+        return "{" * marker * nam * " : " * ty * "}"
+    elseif name === Symbol("@mutual")
+        length(args) == 1 || error("@mutual expects a begin...end block")
+        return "mutual\n" * _indent(_emit_idris(args[1]), 2)
+    elseif name === Symbol("@namespace")
+        length(args) == 2 || error("@namespace expects a name and a begin...end block")
+        return "namespace " * _emit_idris(args[1]) * "\n" * _indent(_emit_idris(args[2]), 2)
+    elseif name === Symbol("@parameters")
+        length(args) == 2 || error("@parameters expects a parameter list and a begin...end block")
+        head = _emit_idris(args[1])
+        if !(args[1] isa Expr && args[1].head === :tuple)
+            head = "(" * head * ")"
+        end
+        return "parameters " * head * "\n" * _indent(_emit_idris(args[2]), 2)
+    elseif name === Symbol("@interface") || name === Symbol("@implementation")
+        length(args) == 2 || error("$name expects a head and a begin...end block")
+        kw = name === Symbol("@interface") ? "interface" : "implementation"
+        return kw * " " * _emit_idris(args[1]) * " where\n" * _indent(_emit_idris(args[2]), 2)
+    elseif name === Symbol("@case")
+        length(args) == 2 || error("@case expects a scrutinee and a begin...end block")
+        return "case " * _emit_idris(args[1]) * " of\n" *
+               join(_case_clauses(args[2]), "\n")
+    elseif name === Symbol("@with")
+        length(args) == 3 || error("@with expects (lhs, scrutinee, begin...end block)")
+        lhs = _emit_idris(args[1])
+        scrut = _emit_idris(args[2])
+        return lhs * " with (" * scrut * ")\n" *
+               join(_with_clauses(lhs, args[3]), "\n")
+    elseif name === Symbol("@lam")
+        length(args) >= 2 || error("@lam expects at least one parameter and a body")
+        params = join([_emit_idris(a) for a in args[1:end-1]], ", ")
+        return "(\\" * params * " => " * _emit_idris(args[end]) * ")"
+    elseif name === Symbol("@do")
+        length(args) == 1 || error("@do expects a begin...end block")
+        return _emit_do(args[1])
+    elseif name === Symbol("@where")
+        length(args) == 2 || error("@where expects an expression and a begin...end block")
+        return _emit_idris(args[1]) * " where\n" * _indent(_emit_idris(args[2]), 2)
+    elseif name === Symbol("@rewrite")
+        length(args) == 2 || error("@rewrite expects (prf, expr)")
+        return "rewrite " * _emit_idris(args[1]) * " in " * _emit_idris(args[2])
+    elseif name === Symbol("@as")
+        length(args) == 2 || error("@as expects (name, pattern)")
+        return _emit_idris(args[1]) * "@(" * _emit_idris(args[2]) * ")"
+    elseif name === Symbol("@dpair")
+        length(args) == 2 || error("@dpair expects (a, b)")
+        return _emit_idris(args[1]) * " ** " * _emit_idris(args[2])
+    elseif name === Symbol("@vis")
+        length(args) == 2 || error("@vis expects (visibility, declaration)")
+        return String(args[1]) * " " * _emit_idris(args[2])
+    elseif name === Symbol("@pragma")
+        return join([a isa AbstractString ? String(a) : _emit_idris(a) for a in args], "\n")
     elseif name === Symbol("@export")
         return join(["%export " * _idris_string_literal(String(a)) for a in args], "\n")
     elseif name === Symbol("@foreign")

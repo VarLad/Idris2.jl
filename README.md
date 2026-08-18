@@ -131,11 +131,20 @@ syntax:
 
 - `module Name ... end` (native Julia `module`)
 - `import Data.List` / `using Data.List`
-- `name : Type` and `name(x) = body`
-- `if c; a; else; b; end` and `let x = e; body end`
-- `@data Name(params) begin ... end` and `@record Name begin ... end`
-- `@export "backend:name"` and `@foreign "..."` pragmas
-- raw `idris"""..."""` sections for anything the Julia parser cannot express
+- `name : Type` and `name(x) = body`, plus `@where body begin ... end` helper blocks
+- `if c; a; else; b; end`, `let x = e; body end`, `@case s begin p => b; end`
+- `@lam(x, body)` lambdas, `@do begin x <- act; ... end` do-blocks, and
+  `@with(lhs, scrut, begin p => b; end)` with-notation
+- `@data Name(params) begin ... end` (simple ADTs) and GADT `where` form via
+  `@data Name(...) begin Ctor : sig; ... end`
+- `@record Name begin ... end`
+- block forms: `@mutual`, `@namespace`, `@parameters`, `@interface`, `@implementation`
+- binder macros `@implicit` / `@auto` / `@erased` / `@linear`, and
+  `@ctor "name"` for symbolic constructors (used as `var"(::)"(x, xs)`)
+- `@as(name, pattern)`, `@rewrite(prf, expr)`, `@dpair(a, b)`
+- `@vis "export" decl`, `@pragma "%directive"`, `@export "backend:name"`,
+  `@foreign "..."` pragmas, and `..` ranges
+- raw `idris"""..."""` sections for anything the Julia parser still can't express
 
 ```julia
 M = @idris cg=julia module Main
@@ -153,6 +162,25 @@ M = @idris cg=julia module Main
     main = putStrLn(show(square(7)))
 end
 M.main()
+```
+
+GADTs use the `where` form when a constructor carries an explicit `: sig`:
+
+```julia
+M = @idris module Main
+    @data Vect(Nat, Type) begin
+        VNil  : Vect(Z, a)
+        VCons : (x : a) -> (xs : Vect(n, a)) -> Vect(S(n), a)
+    end
+
+    vlen : Vect(n, a) -> Nat
+    vlen(VNil) = 0
+    vlen(VCons(x, xs)) = 1 + vlen(xs)
+
+    main : IO()
+    main = putStrLn(show(vlen(VCons(1, VCons(2, VNil)))))
+end
+M.main()  # 2
 ```
 
 Supported options: `cg=...`, `package=...`/`pkg=...`, `directive=...`, and the
